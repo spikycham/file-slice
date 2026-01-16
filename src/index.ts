@@ -9,10 +9,19 @@ import { db } from "./db/index";
 /* Initiation */
 const app = express();
 app.use(express.json());
+app.use((_, res, next) => {
+    const headers = new Headers({
+        "Access-Control-Allow-Origin": "http://127.0.0.1:5555",
+        "Access-Control-Allow-Methods": "GET, POST",
+        "Access-Control-Allow-Headers": "Content-Type",
+    });
+    res.setHeaders(headers);
+    next();
+});
 
 /* APIs */
 app.get("/", (_, res) => {
-    res.send("hello");
+    res.send({ message: "hello" });
 });
 
 // Preflight the file existance
