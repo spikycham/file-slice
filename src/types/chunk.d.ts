@@ -10,6 +10,7 @@ type ResponseUploadChunk =
 
 type RequestUploadChunk = Request & {
     file: Express.Multer.File;
+    filename: string;
     chunkIndex: string;
     totalIndex: string;
     chunkSize: string;

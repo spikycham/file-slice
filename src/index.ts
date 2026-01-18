@@ -49,27 +49,18 @@ app.post(
             .get(req.body.fileHash) as QueryUploadSessionObject;
 
         if (uploadSession) {
-            const { upload_id: uploadId } = uploadSession;
+            const { upload_id: uploadId, total_index: totalIndex } = uploadSession;
 
-            const uploadedChunks = db
-                .query("SELECT chunk_index, total_index FROM chunks WHERE upload_id = ?")
-                .all(uploadId) as QueryChunkObject[];
-
-            // No chunk has uploaded
-            if (!uploadedChunks.length) {
-                return res.json({
-                    exist: false,
-                    required: Array.from({ length: req.body.totalIndex }, (_, i) => i),
-                    uploadId,
-                });
-            }
-
-            const { total_index } = uploadedChunks[0]!;
             // Chunk size mismatch
-            if (req.body.totalIndex !== total_index) {
-                db.run("DELETE FROM upload_sessions WHERE file_hash = ?", [req.body.fileHash]);
+            if (req.body.totalIndex !== totalIndex) {
                 db.run("DELETE FROM chunks WHERE upload_id = ?", [uploadId]);
-                fs.rmdirSync(path.resolve(`./src/uploads/${req.body.filename}`));
+                db.run("UPDATE upload_sessions SET total_index = ?", [req.body.totalIndex]);
+                // Delete files
+                const dir = path.resolve(`./src/uploads/${req.body.filename}`);
+                for (const name of fs.readdirSync(dir)) {
+                    const p = path.join(dir, name);
+                    fs.unlinkSync(p);
+                }
 
                 return res.json({
                     exist: false,
@@ -78,24 +69,32 @@ app.post(
                 });
             }
 
+            // TODO: watch this
+            const uploadedChunks = db
+                .query("SELECT chunk_index FROM chunks WHERE upload_id = ?")
+                .all(uploadId) as QueryChunkObject[];
             // Calculate all required chunks indice
-            const existChunkIndices = uploadedChunks.map((chunk) => chunk.chunk_index);
+            const existIndices = uploadedChunks.map((c) => c.chunk_index);
+
             return res.json({
                 exist: false,
-                required: Array.from({ length: total_index }, (_, i) => i).filter(
-                    (indice) => !existChunkIndices.includes(indice),
+                required: Array.from({ length: totalIndex }, (_, i) => i).filter(
+                    (indice) => !existIndices.includes(indice),
                 ),
                 uploadId,
             });
         }
 
-        // Create upload session & folder
+        // Create upload session & folder when no upload session
         const uploadId = Math.random().toString(32).slice(2, 12) + Date.now();
         db.run(
-            "INSERT INTO upload_sessions (upload_id, file_hash, filename, chunk_size) VALUES (?, ?, ?, ?)",
-            [uploadId, req.body.fileHash, req.body.filename, req.body.chunkSize],
+            "INSERT INTO upload_sessions (upload_id, file_hash, filename, total_index) VALUES (?, ?, ?, ?)",
+            [uploadId, req.body.fileHash, req.body.filename, req.body.totalIndex],
         );
-        fs.mkdirSync(path.resolve(`./src/uploads/${req.body.filename}`));
+        const dir = path.resolve(`./src/uploads/${req.body.filename}`);
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir);
+        }
 
         return res.json({
             exist: false,
@@ -106,20 +105,7 @@ app.post(
 );
 
 /* Upload single chunk */
-const storage = multer.diskStorage({
-    destination: (_1, file, callback) => {
-        const dir = path.resolve(`./src/uploads/${file.originalname}`);
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir);
-        }
-        callback(null, dir);
-    },
-    filename: (req, file, callback) => {
-        const name = file.originalname.replace(/\.[^/.]+$/, "");
-        callback(null, `${name}-${req.body.chunkIndex}`);
-    },
-});
-const upload = multer({ storage });
+const upload = multer({ storage: multer.memoryStorage() });
 app.post(
     "/upload/chunk",
     upload.single("file"),
@@ -134,8 +120,14 @@ app.post(
             });
         }
 
-        const dir = path.resolve(`./src/uploads/${req.file.originalname}/`);
-        const filename = req.file.filename;
+        const dir = path.resolve(`./src/uploads/${req.body.filename}/`);
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir);
+        }
+        const filename = `${req.body.chunkIndex}.bin`;
+
+        fs.writeFileSync(path.join(dir, filename), req.file.buffer);
+
         const filebuffer = fs.readFileSync(path.resolve(dir, filename));
         const hash = crypto.createHash("sha256").update(filebuffer).digest("hex");
 
@@ -148,13 +140,16 @@ app.post(
         }
 
         // Save chunk to database
-        db.run("INSERT INTO chunks (upload_id, chunk_hash, chunk_index, total_index, chunk_size)", [
-            req.body.uploadId,
-            req.body.chunkHash,
-            Number(req.body.chunkIndex),
-            Number(req.body.totalIndex),
-            Number(req.body.chunkSize),
-        ]);
+        db.run(
+            "INSERT INTO chunks (upload_id, chunk_hash, chunk_index, total_index, chunk_size) VALUES (?, ?, ?, ?, ?)",
+            [
+                req.body.uploadId,
+                req.body.chunkHash,
+                Number(req.body.chunkIndex),
+                Number(req.body.totalIndex),
+                Number(req.body.chunkSize),
+            ],
+        );
         return res.json({
             // PERF: what data is required?
             data: {},
@@ -167,8 +162,22 @@ app.post(
 app.post(
     "/upload/merge",
     (req: Request<{}, ResponseMerge, RequestMerge>, res: Response<ResponseMerge>) => {
+        const uploadSession = db
+            .query("SELECT file_hash FROM upload_sessions WHERE upload_id = ?")
+            .get(req.body.uploadId) as QueryUploadSessionObject;
+        const file = db
+            .query("SELECT 1 FROM files WHERE file_hash = ?")
+            .get(uploadSession.file_hash);
+        if (file)
+            return res.json({
+                data: null,
+                message: "File exists.",
+            });
+
         const dir = path.resolve(`./src/uploads/${req.body.filename}`);
-        const files = fs.readdirSync(dir);
+        const files = fs
+            .readdirSync(dir)
+            .sort((a, b) => Number(a.split(".")[0]) - Number(b.split(".")[0]));
 
         const targetPath = path.resolve(`./src/storage/${req.body.filename}`);
         const writeStream = fs.createWriteStream(targetPath);
@@ -179,10 +188,19 @@ app.post(
         }
         writeStream.close();
 
-        return res.json({
-            // PERF: what data is required?
-            data: {},
-            message: null,
+        writeStream.on("finish", () => {
+            const { size } = fs.statSync(targetPath);
+            db.run("INSERT INTO files (file_hash, file_size, filename) VALUES (?, ?, ?) ", [
+                uploadSession.file_hash,
+                size,
+                req.body.filename,
+            ]);
+
+            return res.json({
+                // PERF: what data is required?
+                data: {},
+                message: null,
+            });
         });
     },
 );

@@ -11,8 +11,6 @@ type ResponseUploadCheck =
       };
 type RequestUploadCheck = {
     fileHash: string;
-    fileSize: number;
-    chunkSize: number;
     totalIndex: number;
     filename: string;
 };
@@ -25,9 +23,9 @@ interface QueryFileObject {
 }
 interface QueryUploadSessionObject {
     upload_id: string;
-    file_hash: string;
     filename: string;
-    chunk_size: number;
+    file_hash: string;
+    total_index: number;
 }
 interface QueryChunkObject {
     // upload_id: string;
